@@ -6,19 +6,20 @@
 #include <vector>
 
 #include "envoy/common/exception.h"
-#include "envoy/runtime/runtime.h"
+#include "envoy/stats/scope.h"
 
 #include "common/common/assert.h"
 #include "common/common/base64.h"
 #include "common/common/fmt.h"
 #include "common/common/hex.h"
+#include "common/common/utility.h"
+#include "common/protobuf/utility.h"
 #include "common/ssl/utility.h"
 
 #include "openssl/hmac.h"
 #include "openssl/rand.h"
 #include "openssl/x509v3.h"
 #include "openssl/err.h"
-#include "openssl/evp.h"
 
 namespace Envoy {
 namespace Ssl {
@@ -31,8 +32,9 @@ int ContextImpl::sslContextIndex() {
   }());
 }
 
-ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
-    : ctx_(SSL_CTX_new(TLS_method())), scope_(scope), stats_(generateStats(scope)) {
+ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config, TimeSource& time_source)
+    : ctx_(SSL_CTX_new(TLS_method())), scope_(scope), stats_(generateStats(scope)),
+    time_source_(time_source) {
   RELEASE_ASSERT(ctx_, "");
 
   int rc = SSL_CTX_set_ex_data(ctx_.get(), sslContextIndex(), this);
@@ -79,17 +81,19 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
 
   int verify_mode = SSL_VERIFY_NONE;
 
-  if (!config.caCert().empty()) {
-    ca_file_path_ = config.caCertPath();
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->caCert().empty()) {
+    ca_file_path_ = config.certificateValidationContext()->caCertPath();
     bssl::UniquePtr<BIO> bio(
-        BIO_new_mem_buf(const_cast<char*>(config.caCert().data()), config.caCert().size()));
+        BIO_new_mem_buf(const_cast<char*>(config.certificateValidationContext()->caCert().data()),
+                        config.certificateValidationContext()->caCert().size()));
     RELEASE_ASSERT(bio != nullptr, "");
     // Based on BoringSSL's X509_load_cert_crl_file().
     bssl::UniquePtr<STACK_OF(X509_INFO)> list(
         PEM_X509_INFO_read_bio(bio.get(), nullptr, nullptr, nullptr));
     if (list == nullptr) {
-      throw EnvoyException(
-          fmt::format("Failed to load trusted CA certificates from {}", config.caCertPath()));
+      throw EnvoyException(fmt::format("Failed to load trusted CA certificates from {}",
+                           config.certificateValidationContext()->caCertPath()));
     }
 
     X509_STORE* store = SSL_CTX_get_cert_store(ctx_.get());
@@ -110,8 +114,8 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
       }
     }
     if (ca_cert_ == nullptr) {
-      throw EnvoyException(
-          fmt::format("Failed to load trusted CA certificates from {}", config.caCertPath()));
+      throw EnvoyException(fmt::format("Failed to load trusted CA certificates from {}",
+                           config.certificateValidationContext()->caCertPath()));
     }
 
     verify_mode = SSL_VERIFY_PEER;
@@ -121,15 +125,17 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
     // directly. However, our new callback is still calling X509_verify_cert() under
     // the hood. Therefore, to ignore cert expiration, we need to set the callback
     // for X509_verify_cert to ignore that error.
-    if (config.allowExpiredCertificate()) {
+    if (config.certificateValidationContext()->allowExpiredCertificate()) {
       X509_STORE_set_verify_cb(store, ContextImpl::ignoreCertificateExpirationCallback);
     }
   }
 
-  if (!config.certificateRevocationList().empty()) {
-    bssl::UniquePtr<BIO> bio(
-        BIO_new_mem_buf(const_cast<char*>(config.certificateRevocationList().data()),
-                        config.certificateRevocationList().size()));
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->certificateRevocationList().empty()) {
+    bssl::UniquePtr<BIO> bio(BIO_new_mem_buf(
+        const_cast<char*>(
+            config.certificateValidationContext()->certificateRevocationList().data()),
+            config.certificateValidationContext()->certificateRevocationList().size()));
     RELEASE_ASSERT(bio != nullptr, "");
 
     // Based on BoringSSL's X509_load_cert_crl_file().
@@ -137,7 +143,8 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
         PEM_X509_INFO_read_bio(bio.get(), nullptr, nullptr, nullptr));
     if (list == nullptr) {
       throw EnvoyException(
-          fmt::format("Failed to load CRL from {}", config.certificateRevocationListPath()));
+          fmt::format("Failed to load CRL from {}",
+                      config.certificateValidationContext()->certificateRevocationListPath()));
     }
 
     X509_STORE* store = SSL_CTX_get_cert_store(ctx_.get());
@@ -150,13 +157,15 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
     X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
   }
 
-  if (!config.verifySubjectAltNameList().empty()) {
-    verify_subject_alt_name_list_ = config.verifySubjectAltNameList();
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->verifySubjectAltNameList().empty()) {
+    verify_subject_alt_name_list_ = config.certificateValidationContext()->verifySubjectAltNameList();
     verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
   }
 
-  if (!config.verifyCertificateHashList().empty()) {
-    for (auto hash : config.verifyCertificateHashList()) {
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->verifyCertificateHashList().empty()) {
+    for (auto hash : config.certificateValidationContext()->verifyCertificateHashList()) {
       // Remove colons from the 95 chars long colon-separated "fingerprint"
       // in order to get the hex-encoded string.
       if (hash.size() == 95) {
@@ -171,8 +180,9 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
     verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
   }
 
-  if (!config.verifyCertificateSpkiList().empty()) {
-    for (auto hash : config.verifyCertificateSpkiList()) {
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->verifyCertificateSpkiList().empty()) {
+    for (auto hash : config.certificateValidationContext()->verifyCertificateSpkiList()) {
       const auto decoded = Base64::decode(hash);
       if (decoded.size() != SHA256_DIGEST_LENGTH) {
         throw EnvoyException(fmt::format("Invalid base64-encoded SHA-256 {}", hash));
@@ -188,22 +198,19 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
     SSL_CTX_set_cert_verify_callback(ctx_.get(), ContextImpl::verifyCallback, this);
   }
 
-  if (config.certChain().empty() != config.privateKey().empty()) {
-    throw EnvoyException(fmt::format("Failed to load incomplete certificate from {}, {}",
-                                     config.certChainPath(), config.privateKeyPath()));
-  }
-
-  if (!config.certChain().empty()) {
+  if (config.tlsCertificate() != nullptr) {
 
     // Load certificate chain.
-    cert_chain_file_path_ = config.certChainPath();
+    const auto& tls_certificate = *config.tlsCertificate();
+    cert_chain_file_path_ = tls_certificate.certificateChainPath();
     bssl::UniquePtr<BIO> bio(
-        BIO_new_mem_buf(const_cast<char*>(config.certChain().data()), config.certChain().size()));
+        BIO_new_mem_buf(const_cast<char*>(tls_certificate.certificateChain().data()),
+                        tls_certificate.certificateChain().size()));
     RELEASE_ASSERT(bio != nullptr, "");
     cert_chain_.reset(PEM_read_bio_X509_AUX(bio.get(), nullptr, nullptr, nullptr));
     if (cert_chain_ == nullptr || !SSL_CTX_use_certificate(ctx_.get(), cert_chain_.get())) {
       throw EnvoyException(
-          fmt::format("Failed to load certificate chain from {}", config.certChainPath()));
+          fmt::format("Failed to load certificate chain from {}", cert_chain_file_path_));
     }
     // Read rest of the certificate chain.
     while (true) {
@@ -214,7 +221,7 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
 
       if (!SSL_CTX_add_extra_chain_cert(ctx_.get(), cert.get())) {
         throw EnvoyException(
-            fmt::format("Failed to load certificate chain from {}", config.certChainPath()));
+            fmt::format("Failed to load certificate chain from {}", cert_chain_file_path_));
       }
       // SSL_CTX_add_extra_chain_cert() takes ownership.
       cert.release();
@@ -225,17 +232,17 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const ContextConfig& config)
       ERR_clear_error();
     } else {
       throw EnvoyException(
-          fmt::format("Failed to load certificate chain from {}", config.certChainPath()));
+          fmt::format("Failed to load certificate chain from {}", cert_chain_file_path_));
     }
 
     // Load private key.
-    bio.reset(
-        BIO_new_mem_buf(const_cast<char*>(config.privateKey().data()), config.privateKey().size()));
+    bio.reset(BIO_new_mem_buf(const_cast<char*>(tls_certificate.privateKey().data()),
+              tls_certificate.privateKey().size()));
     RELEASE_ASSERT(bio != nullptr, "");
     bssl::UniquePtr<EVP_PKEY> pkey(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
     if (pkey == nullptr || !SSL_CTX_use_PrivateKey(ctx_.get(), pkey.get())) {
       throw EnvoyException(
-          fmt::format("Failed to load private key from {}", config.privateKeyPath()));
+          fmt::format("Failed to load private key from {}", tls_certificate.privateKeyPath()));
     }
   }
 
@@ -251,11 +258,6 @@ int ServerContextImpl::alpnSelectCallback(const unsigned char** out, unsigned ch
   // Currently this uses the standard selection algorithm in priority order.
   const uint8_t* alpn_data = &parsed_alpn_protocols_[0];
   size_t alpn_data_size = parsed_alpn_protocols_.size();
-  if (!parsed_alt_alpn_protocols_.empty() &&
-      runtime_.snapshot().featureEnabled("ssl.alt_alpn", 0)) {
-    alpn_data = &parsed_alt_alpn_protocols_[0];
-    alpn_data_size = parsed_alt_alpn_protocols_.size();
-  }
 
   if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, alpn_data, alpn_data_size, in,
                             inlen) != OPENSSL_NPN_NEGOTIATED) {
@@ -468,50 +470,59 @@ SslStats ContextImpl::generateStats(Stats::Scope& store) {
 }
 
 size_t ContextImpl::daysUntilFirstCertExpires() const {
-  int daysUntilExpiration = getDaysUntilExpiration(ca_cert_.get());
+  int daysUntilExpiration = Utility::getDaysUntilExpiration(ca_cert_.get(), time_source_);
   daysUntilExpiration =
-      std::min<int>(getDaysUntilExpiration(cert_chain_.get()), daysUntilExpiration);
+      std::min<int>(Utility::getDaysUntilExpiration(cert_chain_.get(), time_source_), daysUntilExpiration);
   if (daysUntilExpiration < 0) { // Ensure that the return value is unsigned
     return 0;
   }
   return daysUntilExpiration;
 }
 
-int32_t ContextImpl::getDaysUntilExpiration(const X509* cert) const {
-  if (cert == nullptr) {
-    return std::numeric_limits<int>::max();
-  }
-  int days, seconds;
-  if (ASN1_TIME_diff(&days, &seconds, nullptr, X509_get_notAfter(cert))) {
-    return days;
-  }
-  return 0;
-}
-
-std::string ContextImpl::getCaCertInformation() const {
-
+CertificateDetailsPtr ContextImpl::getCaCertInformation() const {
   if (ca_cert_ == nullptr) {
-    return "";
+    return nullptr;
   }
-  return fmt::format("Certificate Path: {}, Serial Number: {}, Days until Expiration: {}",
-                     getCaFileName(), Utility::getSerialNumberFromCertificate(ca_cert_.get()),
-                     getDaysUntilExpiration(ca_cert_.get()));
+  return certificateDetails(ca_cert_.get(), getCaFileName());
 }
 
-std::string ContextImpl::getCertChainInformation() const {
-
+CertificateDetailsPtr ContextImpl::getCertChainInformation() const {
   if (cert_chain_ == nullptr) {
-    return "";
+    return nullptr;
   }
-  return fmt::format("Certificate Path: {}, Serial Number: {}, Days until Expiration: {}",
-                     getCertChainFileName(),
-                     Utility::getSerialNumberFromCertificate(cert_chain_.get()),
-                     getDaysUntilExpiration(cert_chain_.get()));
+  return certificateDetails(cert_chain_.get(), getCertChainFileName());
 }
 
-ClientContextImpl::ClientContextImpl(Stats::Scope& scope, const ClientContextConfig& config)
-    : ContextImpl(scope, config), server_name_indication_(config.serverNameIndication()),
-      allow_renegotiation_(config.allowRenegotiation()) {
+CertificateDetailsPtr ContextImpl::certificateDetails(X509* cert, const std::string& path) const {
+  CertificateDetailsPtr certificate_details =
+      std::make_unique<envoy::admin::v2alpha::CertificateDetails>();
+  certificate_details->set_path(path);
+  certificate_details->set_serial_number(Utility::getSerialNumberFromCertificate(*cert));
+  certificate_details->set_days_until_expiration(
+      Utility::getDaysUntilExpiration(cert, time_source_));
+  ProtobufWkt::Timestamp* valid_from = certificate_details->mutable_valid_from();
+  TimestampUtil::systemClockToTimestamp(Utility::getValidFrom(*cert), *valid_from);
+  ProtobufWkt::Timestamp* expiration_time = certificate_details->mutable_expiration_time();
+  TimestampUtil::systemClockToTimestamp(Utility::getExpirationTime(*cert), *expiration_time);
+
+  for (auto& dns_san : Utility::getSubjectAltNames(*cert, GEN_DNS)) {
+    envoy::admin::v2alpha::SubjectAlternateName& subject_alt_name =
+        *certificate_details->add_subject_alt_names();
+    subject_alt_name.set_dns(dns_san);
+  }
+  for (auto& uri_san : Utility::getSubjectAltNames(*cert, GEN_URI)) {
+    envoy::admin::v2alpha::SubjectAlternateName& subject_alt_name =
+        *certificate_details->add_subject_alt_names();
+    subject_alt_name.set_uri(uri_san);
+  }
+  return certificate_details;
+}
+
+ClientContextImpl::ClientContextImpl(Stats::Scope& scope, const ClientContextConfig& config,
+                                     TimeSource& time_source)
+    : ContextImpl(scope, config, time_source),
+      server_name_indication_(config.serverNameIndication()),
+allow_renegotiation_(config.allowRenegotiation()) {
 
   if (!parsed_alpn_protocols_.empty()) {
     int rc = SSL_CTX_set_alpn_protos(ctx_.get(), &parsed_alpn_protocols_[0],
@@ -539,17 +550,18 @@ bssl::UniquePtr<SSL> ClientContextImpl::newSsl() const {
 
 ServerContextImpl::ServerContextImpl(Stats::Scope& scope, const ServerContextConfig& config,
                                      const std::vector<std::string>& server_names,
-                                     Runtime::Loader& runtime)
-    : ContextImpl(scope, config), runtime_(runtime),
-      session_ticket_keys_(config.sessionTicketKeys()) {
+                                     TimeSource& time_source)
+: ContextImpl(scope, config, time_source), session_ticket_keys_(config.sessionTicketKeys()) {
 
-  if (config.certChain().empty()) {
+  if (config.tlsCertificate() == nullptr) {
     throw EnvoyException("Server TlsCertificates must have a certificate specified");
   }
 
-  if (!config.caCert().empty()) {
+  if (config.certificateValidationContext() != nullptr &&
+      !config.certificateValidationContext()->caCert().empty()) {
     bssl::UniquePtr<BIO> bio(
-        BIO_new_mem_buf(const_cast<char*>(config.caCert().data()), config.caCert().size()));
+        BIO_new_mem_buf(const_cast<char*>(config.certificateValidationContext()->caCert().data()),
+                        config.certificateValidationContext()->caCert().size()));
     RELEASE_ASSERT(bio != nullptr, "");
     // Based on BoringSSL's SSL_add_file_cert_subjects_to_stack().
     bssl::UniquePtr<STACK_OF(X509_NAME)> list(sk_X509_NAME_new(
@@ -563,7 +575,7 @@ ServerContextImpl::ServerContextImpl(Stats::Scope& scope, const ServerContextCon
       X509_NAME* name = X509_get_subject_name(cert.get());
       if (name == nullptr) {
         throw EnvoyException(fmt::format("Failed to load trusted client CA certificates from {}",
-                                         config.caCertPath()));
+                             config.certificateValidationContext()->caCertPath()));
       }
       // Check for duplicates.
       if (sk_X509_NAME_find(list.get(), nullptr, name)) {
@@ -573,7 +585,7 @@ ServerContextImpl::ServerContextImpl(Stats::Scope& scope, const ServerContextCon
 
       if (name_dup == nullptr || !sk_X509_NAME_push(list.get(), name_dup.release())) {
         throw EnvoyException(fmt::format("Failed to load trusted client CA certificates from {}",
-                                         config.caCertPath()));
+                             config.certificateValidationContext()->caCertPath()));
       }
     }
     // Check for EOF.
@@ -581,8 +593,8 @@ ServerContextImpl::ServerContextImpl(Stats::Scope& scope, const ServerContextCon
     if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
       ERR_clear_error();
     } else {
-      throw EnvoyException(fmt::format("Failed to load trusted client CA certificates from {}",
-                                       config.caCertPath()));
+       throw EnvoyException(fmt::format("Failed to load trusted client CA certificates from {}",
+                            config.certificateValidationContext()->caCertPath()));
     }
 
     if (sk_X509_NAME_num(list.get()) > 0)
@@ -593,8 +605,6 @@ ServerContextImpl::ServerContextImpl(Stats::Scope& scope, const ServerContextCon
       SSL_CTX_set_verify(ctx_.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
     }
   }
-
-  parsed_alt_alpn_protocols_ = parseAlpnProtocols(config.altAlpnProtocols());
 
   if (!parsed_alpn_protocols_.empty()) {
     SSL_CTX_set_alpn_select_cb(ctx_.get(),
