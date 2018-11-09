@@ -15,6 +15,24 @@ using Envoy::Network::PostIoAction;
 namespace Envoy {
 namespace Ssl {
 
+namespace {
+// This SslSocket will be used when SSL secret is not fetched from SDS server.
+class NotReadySslSocket : public Network::TransportSocket {
+public:
+  // Network::TransportSocket
+  void setTransportSocketCallbacks(Network::TransportSocketCallbacks&) override {}
+  std::string protocol() const override { return EMPTY_STRING; }
+  bool canFlushClose() override { return true; }
+  void closeSocket(Network::ConnectionEvent) override {}
+  Network::IoResult doRead(Buffer::Instance&) override { return {PostIoAction::Close, 0, false}; }
+  Network::IoResult doWrite(Buffer::Instance&, bool) override {
+    return {PostIoAction::Close, 0, false};
+  }
+  void onConnected() override {}
+  const Ssl::Connection* ssl() const override { return nullptr; }
+};
+} // namespace
+
 SslSocket::SslSocket(ContextSharedPtr ctx, InitialState state)
     : ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)), ssl_(ctx_->newSsl()) {
   if (state == InitialState::Client) {
@@ -380,8 +398,33 @@ ServerSslSocketFactory::ServerSslSocketFactory(ServerContextConfigPtr config,
   config_->setSecretUpdateCallback([this]() { onAddOrUpdateSecret(); });
 }
 
-bool ServerSslSocketFactory::implementsSecureTransport() const { 
-  return true;
+Network::TransportSocketPtr ServerSslSocketFactory::createTransportSocket() const {
+  // onAddOrUpdateSecret() could be invoked in the middle of checking the existence of ssl_ctx and
+  // creating SslSocket using ssl_ctx. Capture ssl_ctx_ into a local variable so that we check and
+  // use the same ssl_ctx to create SslSocket.
+  ServerContextSharedPtr ssl_ctx;
+  {
+    absl::ReaderMutexLock l(&ssl_ctx_mu_);
+    ssl_ctx = ssl_ctx_;
+  }
+  if (ssl_ctx) {
+    return std::make_unique<Ssl::SslSocket>(std::move(ssl_ctx), Ssl::InitialState::Server);
+  } else {
+    ENVOY_LOG(debug, "Create NotReadySslSocket");
+    stats_.downstream_context_secrets_not_ready_.inc();
+    return std::make_unique<NotReadySslSocket>();
+  }
+}
+
+bool ServerSslSocketFactory::implementsSecureTransport() const { return true; }
+
+void ServerSslSocketFactory::onAddOrUpdateSecret() {
+  ENVOY_LOG(debug, "Secret is updated.");
+  {
+    absl::WriterMutexLock l(&ssl_ctx_mu_);
+    ssl_ctx_ = manager_.createSslServerContext(stats_scope_, *config_, server_names_);
+  }
+  stats_.ssl_context_update_by_sds_.inc();
 }
 
 } // namespace Ssl

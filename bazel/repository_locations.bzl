@@ -84,9 +84,9 @@ REPOSITORY_LOCATIONS = dict(
         urls = ["https://github.com/googleapis/googleapis/archive/d6f78d948c53f3b400bb46996eb3084359914f9b.tar.gz"],
     ),
     com_github_google_jwt_verify = dict(
-        sha256 = "20c4d33db732c2a0826cafca05e0ca3c9b6987a837582d0d477e57911706aae5",
-        strip_prefix = "jwt_verify_lib-0.3",
-        urls = ["https://github.com/bdecoste/jwt_verify_lib/archive/0.3.tar.gz"],
+        sha256 = "637c0743d47ef632a283917cf989e3d6c2b3fc8e7e5cbc8302f59efeed28a919",
+        strip_prefix = "jwt_verify_lib-0.5",
+        urls = ["https://github.com/bdecoste/jwt_verify_lib/archive/0.5.tar.gz"],
     ),
     com_github_nodejs_http_parser = dict(
         sha256 = "f742dc5a206958c4d0a6b2c35e3e102afb5683f55f7a7cb1eae024a03f081347",

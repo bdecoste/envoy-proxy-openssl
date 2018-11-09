@@ -123,16 +123,8 @@ envoy_cc_library(
     name = "ssl_impl_lib",
     hdrs = ["ssl_impl.h"],
     deps = [
-        ":bssl_wrapper_lib",
+        "@bssl_wrapper//:bssl_wrapper",
     ],
 )
 
-envoy_cc_library(
-    name = "bssl_wrapper_lib",
-    srcs = ["bssl_wrapper.cc"],
-    hdrs = ["bssl_wrapper.h"],
-    external_deps = [
-        "ssl",
-    ],
-)
 
