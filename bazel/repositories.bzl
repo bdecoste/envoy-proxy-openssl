@@ -223,7 +223,7 @@ def _envoy_api_deps():
         actual = "@six_archive//:six",
     )
 
-def envoy_dependencies(path = "@envoy_deps//", skip_targets = []):
+def envoy_openssl_dependencies(path = "@envoy_deps//", skip_targets = []):
     envoy_repository = repository_rule(
         implementation = _build_recipe_repository_impl,
         environ = [
