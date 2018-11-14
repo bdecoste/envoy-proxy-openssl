@@ -1,5 +1,5 @@
 def envoy_openssl_dependencies():
-    sh_binary(
+    native.sh_binary(
         name = "envoy_openssl",
         srcs = [":envoy_openssl.sh"],
 )
